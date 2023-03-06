@@ -26,10 +26,10 @@ class SignatureProcessor(SubCommand):
     async def run(self):
         async with contextlib.AsyncExitStack() as aes:
             for tse in self.tses:
-                aes.enter_async_context(self.muxer.use_tse(tse))
+                await aes.enter_async_context(self.muxer.use_tse(tse))
 
             async for order in self.get_signature_requests():
-                self.muxer.sign_order(order)
+                await self.muxer.sign_order(order)
 
     async def get_signature_requests(self):
         # if False:

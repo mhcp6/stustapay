@@ -26,9 +26,15 @@ class TSEHandler(abc.ABC):
     """
 
     @abc.abstractmethod
-    async def start(self):
+    async def start(self) -> bool:
         """
-        Starts communication with the TSE
+        Starts communication with the TSE.
+
+        This method shall only return when requests such as register_client_id()
+        can be sent to the TSE.
+
+        This method shall return True if the TSE was started successfully.
+        On failure, awaiting stop() will yield the exception.
         """
         raise NotImplementedError()
 
@@ -47,6 +53,10 @@ class TSEHandler(abc.ABC):
 
         This will be called by the TSEMuxer if the TSE times out on signature requests
         or if it produces some other errors.
+
+        Like with start(), this method shall only return when requests can be sent again,
+        it will return True iff the TSE was reset successfully and awaiting stop() will
+        yield the exception that occured during resetting when False was returned.
         """
         raise NotImplementedError()
 

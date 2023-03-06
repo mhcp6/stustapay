@@ -56,11 +56,12 @@ class ActiveTSE:
         self.pending_signing_requests: asyncio.PriorityQueue[SigningRequest] = asyncio.PriorityQueue()
         self.background_task: typing.Optional[asyncio.Task] = None
 
-    async def start(self):
+    async def start(self) -> bool:
         if self.background_task is not None:
             raise RuntimeError(f"ActiveTSE {self.tse} is already running")
-        await self.tse.start()
+        result = await self.tse.start()
         self.background_task = asyncio.create_task(self.run())
+        return result
 
     async def stop(self):
         """
@@ -114,7 +115,11 @@ class TSEMuxer:
         Context manager that adds the TSE handler to this muxer
         """
         active_tse = ActiveTSE(tse)
-        await active_tse.start()
+        if not await active_tse.start():
+            # active TSE could not be started
+            # immediately fail
+            await active_tse.stop()
+            return
 
         async with self.tse_lock:
             self.tses.append(active_tse)

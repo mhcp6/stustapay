@@ -2,11 +2,12 @@
 
 import asyncio
 import aiohttp
+import contextlib
 import json
 import logging
 import typing
 
-from ..handler import TSEHandler
+from ..handler import Order, OrderSignature, TSEHandler
 from .config import DieboldNixdorfUSBTSEConfig
 
 LOGGER = logging.getLogger(__name__)
@@ -15,25 +16,50 @@ LOGGER = logging.getLogger(__name__)
 class DieboldNixdorfUSBTSE(TSEHandler):
     def __init__(self, config: DieboldNixdorfUSBTSEConfig):
         self.websocket_url = config.diebold_nixdorf_usb_ws_url
+        self.websocket_timeout = config.ws_timeout
         self.background_task: typing.Optional[asyncio.Task] = None
         self.request_id = 0
         self.pending_requests: dict[int, asyncio.Future[dict]] = {}
+        self._started = asyncio.Event()
+        self._stop = False
+        self._ws = None
 
-    async def start(self):
-        self.background_task = asyncio.create_task(self.run())
+    async def start(self) -> bool:
+        self._stop = False
+        start_result: asyncio.Future[bool] = asyncio.Future()
+        self.background_task = asyncio.create_task(self.run(start_result))
+        return await start_result
 
     async def stop(self):
         # TODO cleanly cancel the background task
+        self._stop = True
         await self.background_task
+        self._started.clear()
 
-    async def run(self):
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(self.websocket_url) as ws:
-                receive_task = asyncio.create_task(self.recieve_loop(ws))
-                while True:
-                    await self.request("PingPong", ws=ws)
+    async def run(self, start_result: asyncio.Future[bool]):
+        async with contextlib.AsyncExitStack() as stack:
+            def set_ws(ws):
+                print(f'setting self._ws={ws}')
+                self._ws = ws
+            try:
+                session = await stack.enter_async_context(aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.websocket_timeout, connect=self.websocket_timeout)))
+                LOGGER.info(f'connecting to DN TSE at {self.websocket_url!r}')
+                set_ws(await stack.enter_async_context(session.ws_connect(self.websocket_url)))
+            finally:
+                start_result.set_result(self._ws is not None)
+            stack.callback(set_ws, None)
 
-    async def request(self, command: str, *, ws, timeout: float = 5, **kwargs) -> dict:
+            receive_task = asyncio.create_task(self.recieve_loop())
+            await self.request("SetDefaultClientId", ClientID="DummyDefaultClientId")
+            while not self._stop:
+                print('sending pingpong')
+                result = await self.request("PingPong")
+                print(f'result: {result!r}')
+                await asyncio.sleep(1)
+            await self._ws.close()
+            await receive_task
+
+    async def request(self, command: str, *, timeout: float = 5, **kwargs) -> dict:
         request_id = self.request_id
         self.request_id += 1
 
@@ -41,7 +67,7 @@ class DieboldNixdorfUSBTSE(TSEHandler):
         request.update(kwargs)
 
         LOGGER.info(f"{self}: sending request {request}")
-        await ws.send_str(f"\x02{json.dumps(kwargs)}\x03")
+        await self._ws.send_str(f"\x02{json.dumps(kwargs)}\x03")
         future: asyncio.Future[dict] = asyncio.Future()
         self.pending_requests[request_id] = future
         try:
@@ -56,13 +82,13 @@ class DieboldNixdorfUSBTSE(TSEHandler):
             LOGGER.error(error_message)
             raise asyncio.TimeoutError(error_message)
 
-    async def recieve_loop(self, ws):
+    async def recieve_loop(self):
         """
         Receives and processes websocket messages.
         Messages that we receive from the websocket are expected to be responses to requests
         that we sent through the request() method.
         """
-        async for msg in ws:
+        async for msg in self._ws:
             msg: aiohttp.WSMessage
             if msg.type == aiohttp.WSMsgType.TEXT:
                 msg.data: str
@@ -95,10 +121,31 @@ class DieboldNixdorfUSBTSE(TSEHandler):
             else:
                 LOGGER.error(f"{self}: unexpected websocket message type: {msg}")
 
-    async def send(self, ws):
-        for i in range(100000):
-            ping = {"Command": "PingPong"}
-            await ws.send_str(f"\x02{json.dumps(ping)}\x03")
-            print(i)
-            await asyncio.sleep(0.0001)
-        await ws.close()
+    async def reset(self) -> bool:
+        await self.stop()
+        return await self.start()
+
+    async def register_client_id(self, client_id: str):
+        result = await self.request("RegisterClientID", ClientID=client_id)
+        if result["Status"] != "ok":
+            raise RuntimeError(f"{self}: Could not register client ID: {result}")
+
+    async def deregister_client_id(self, client_id: str):
+        result = await self.request("DeRegisterClientID", ClientID=client_id)
+        if result["Status"] != "ok":
+            raise RuntimeError(f"{self}: Could not deregister client ID: {result}")
+
+    async def sign_order(self, order: Order) -> OrderSignature:
+        raise NotImplementedError()
+
+    async def get_client_ids(self) -> list[str]:
+        result = await self.request("GetDeviceStatus")
+        if result["Status"] != "ok":
+            raise RuntimeError(f"{self}: Could not query device status: {result}")
+        result = result["ClientIDs"]
+        if not isinstance(result, list) or any(not isinstance(x, str) for x in result):
+            raise RuntimeError(f"{self}: invalid device status: {result}")
+        return result
+
+    def __str__(self):
+        return f'DieboldNixdorfUSBTSEHandler({self.websocket_url})'
