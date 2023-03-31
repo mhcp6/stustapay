@@ -39,7 +39,7 @@ class DieboldNixdorfUSBTSE(TSEHandler):
     async def run(self, start_result: asyncio.Future[bool]):
         async with contextlib.AsyncExitStack() as stack:
             def set_ws(ws):
-                print(f'setting self._ws={ws}')
+                LOGGER.info(f'setting self._ws={ws}')
                 self._ws = ws
             try:
                 session = await stack.enter_async_context(aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.websocket_timeout, connect=self.websocket_timeout)))
@@ -47,17 +47,22 @@ class DieboldNixdorfUSBTSE(TSEHandler):
                 set_ws(await stack.enter_async_context(session.ws_connect(self.websocket_url)))
             finally:
                 start_result.set_result(self._ws is not None)
+
             stack.callback(set_ws, None)
 
             receive_task = asyncio.create_task(self.recieve_loop())
+            async def await_receive_task():
+                await receive_task
+            stack.push_async_callback(await_receive_task)
+            stack.push_async_callback(self._ws.close)
+
             await self.request("SetDefaultClientId", ClientID="DummyDefaultClientId")
             while not self._stop:
                 print('sending pingpong')
                 result = await self.request("PingPong")
                 print(f'result: {result!r}')
                 await asyncio.sleep(1)
-            await self._ws.close()
-            await receive_task
+
 
     async def request(self, command: str, *, timeout: float = 5, **kwargs) -> dict:
         request_id = self.request_id
@@ -67,14 +72,11 @@ class DieboldNixdorfUSBTSE(TSEHandler):
         request.update(kwargs)
 
         LOGGER.info(f"{self}: sending request {request}")
-        await self._ws.send_str(f"\x02{json.dumps(kwargs)}\x03")
+        await self._ws.send_str(f"\x02{json.dumps(request)}\x03")
         future: asyncio.Future[dict] = asyncio.Future()
         self.pending_requests[request_id] = future
         try:
-            # This code is incorrect, as it does not return the result of the future but rather two sets of awaitables
-            # done, pending = await asyncio.wait()
-            # response = await asyncio.wait(future, timeout=timeout)
-            response = await future
+            response = await asyncio.wait_for(future, timeout=timeout)
             LOGGER.info(f"{self}: got response {response}")
             return response
         except asyncio.TimeoutError:
@@ -92,34 +94,37 @@ class DieboldNixdorfUSBTSE(TSEHandler):
             msg: aiohttp.WSMessage
             if msg.type == aiohttp.WSMsgType.TEXT:
                 msg.data: str
-                if not msg.data or msg.data[0] != "\x02" or msg.data[-1] != "\x03":
-                    LOGGER.error(f"{self}: Badly-formatted message: {msg}")
+                print(f'{msg.data=}')
+                if not msg.data.startswith("\x02") or not msg.endswith("\x03\n"):
+                    LOGGER.error(f"{self}: Badly-formatted message: {msg!r}")
                     continue
                 try:
-                    data = json.loads(msg.data[1:-1])
+                    data = json.loads(msg.data[1:-2])
+                    print(f'{data=}')
                 except json.decoder.JSONDecodeError:
-                    LOGGER.error(f"{self}: Invalid JSON: {msg}")
+                    LOGGER.error(f"{self}: Invalid JSON: {msg!r}")
                     continue
                 if not isinstance(data, dict):
-                    LOGGER.error(f"{self}: JSON data is not a dict: {msg}")
+                    LOGGER.error(f"{self}: JSON data is not a dict: {data!r}")
                     continue
+                LOGGER.info(f"{self}: received reply {data}")
                 message_id = data.pop("PingPong")
                 if not isinstance(message_id, int):
-                    LOGGER.error(f"{self}: JSON data has no int PingPong field: {msg}")
+                    LOGGER.error(f"{self}: JSON data has no int PingPong field: {msg!r}")
                     continue
                 future = self.pending_requests.pop(message_id)
                 if future is None:
-                    LOGGER.error(f"{self}: Response does not match any pending request: {msg}")
+                    LOGGER.error(f"{self}: Response does not match any pending request: {msg!r}")
                     continue
                 future.set_result(data)
             elif msg.type == aiohttp.WSMsgType.CLOSE:
-                LOGGER.info(f"{self}: websocket connection has been closed: {msg}")
+                LOGGER.info(f"{self}: websocket connection has been closed: {msg!r}")
                 # TODO recover?
             elif msg.type == aiohttp.WSMsgType.ERROR:
-                LOGGER.error(f"{self}: websocket connection has errored: {msg}")
+                LOGGER.error(f"{self}: websocket connection has errored: {msg!r}")
                 # TODO recover?
             else:
-                LOGGER.error(f"{self}: unexpected websocket message type: {msg}")
+                LOGGER.error(f"{self}: unexpected websocket message type: {msg!r}")
 
     async def reset(self) -> bool:
         await self.stop()
@@ -148,4 +153,4 @@ class DieboldNixdorfUSBTSE(TSEHandler):
         return result
 
     def __str__(self):
-        return f'DieboldNixdorfUSBTSEHandler({self.websocket_url})'
+        return f'DieboldNixdorfUSBTSEHandler({self.websocket_url!r})'
