@@ -215,18 +215,20 @@ values
     on conflict do nothing;
 
 create table if not exists order_type(
-    name text not null primary key
+    name text not null primary key,
+    -- payment type according to KassenSichV
+    zahlungsart text not null
 );
 insert into order_type (
-    name
+    name, zahlungsart
 )
 values
     -- load token with cash
-    ('topup_cash'),
+    ('topup_cash', 'Bar'),
     -- load token with sumup
-    ('topup_sumup'),
+    ('topup_sumup', 'Unbar'),
     -- buy items to consume
-    ('sale')
+    ('sale', 'Unbar')
     on conflict do nothing;
 
 
@@ -351,7 +353,7 @@ create table if not exists till (
     registration_uuid uuid unique,
     session_uuid uuid unique,
 
-    -- how this till is mapped to a tse
+    -- how this till is currently mapped to a tse
     tse_id text,
 
     -- identifies the current active work shift and configuration
@@ -361,6 +363,31 @@ create table if not exists till (
 
     constraint registration_or_session_uuid_null check ((registration_uuid is null) <> (session_uuid is null))
 );
+
+
+create type till_tse_history_type as enum ('register', 'deregister');
+
+
+-- logs all historic till <-> TSE assignments (as registered with the TSE)
+create table if not exists till_tse_history (
+    till_name text not null,
+    tse_id text not null,
+    what till_tse_history_type not null,
+    date timestamptz not null default now()
+);
+
+
+create function deny_in_trigger() returns trigger language plpgsql as
+$$
+begin
+  return null;
+end;
+$$;
+
+
+create trigger till_tse_history_deny_update_delete
+before update or delete on till_tse_history
+for each row execute function deny_in_trigger();
 
 
 create table if not exists order_status (
@@ -592,21 +619,73 @@ end;
 $$ language plpgsql;
 
 
+create type tse_signature_status as enum ('todo', 'pending', 'done', 'failure');
+create table tse_signature_status_info (
+    enum_value tse_signature_status primary key,
+    name text not null,
+    description text not null
+);
+
+
+insert into tse_signature_status_info (enum_value, name, description) values
+    ('todo', 'todo', 'Signature request is enqueued'),
+    ('pending', 'pending', 'Signature is being created by TSE'),
+    ('done', 'done', 'Signature was successful'),
+    ('failure', 'failure', 'Failed to create signature') on conflict do nothing;
+
+
 -- requests the tse module to sign something
 create table if not exists tse_signature (
-    id serial not null primary key references ordr(id) on delete cascade,
+    id serial primary key references ordr(id) on delete cascade,
 
-    signed bool default false,
-    status text,
+    signature_status tse_signature_status not null default 'todo',
+    -- TSE signature result message (error message or success message)
+    result_message  text,
+    constraint result_message_set check ((result_message is null) = (signature_status = 'todo' or signature_status = 'pending')),
 
+    created timestamptz not null default now(),
+    last_update timestamptz not null default now(),
+
+    -- id of the TSE that was used to create the signature
+    tse_id          text,
+    constraint tse_id_set check ((tse_id is null) = (signature_status = 'todo')),
+
+    -- signature data from the TSE
     tse_transaction text,
+    constraint tse_transaction_set check ((tse_transaction is not null) = (signature_status = 'done')),
     tse_signaturenr text,
+    constraint tse_signaturenr_set check ((tse_signaturenr is not null) = (signature_status = 'done')),
     tse_start       text,
+    constraint tse_start_set check ((tse_start is not null) = (signature_status = 'done')),
     tse_end         text,
+    constraint tse_end_set check ((tse_end is not null) = (signature_status = 'done')),
     tse_serial      text,
+    constraint tse_serial_set check ((tse_serial is not null) = (signature_status = 'done')),
     tse_hashalgo    text,
+    constraint tse_hashalgo_set check ((tse_hashalgo is not null) = (signature_status = 'done')),
     tse_signature   text
+    constraint tse_signature_set check ((tse_signature is not null) = (signature_status = 'done'))
 );
+
+
+-- partial index for only the unsigned rows in tse_signature
+create index on tse_signature (id) where signature_status = 'todo';
+create index on tse_signature (id) where signature_status = 'pending';
+
+create function tse_signature_update_trigger_procedure()
+returns trigger as $$
+begin
+    new.last_update = now();
+    return new;
+end;
+$$ language 'plpgsql';
+
+create or replace trigger tse_signature_update_trigger
+    before update
+    on
+        tse_signature
+    for each row
+execute procedure tse_signature_update_trigger_procedure();
 
 
 -- requests the bon generator to create a new receipt

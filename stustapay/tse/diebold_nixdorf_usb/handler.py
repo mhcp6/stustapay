@@ -2,27 +2,42 @@
 
 import asyncio
 import aiohttp
+import base64
 import contextlib
 import json
 import logging
 import typing
 
-from ..handler import Order, OrderSignature, TSEHandler
+from ..handler import TSEHandler, TSESignature, TSESignatureRequest
 from .config import DieboldNixdorfUSBTSEConfig
 
 LOGGER = logging.getLogger(__name__)
 
 
+class RequestError(RuntimeError):
+    def __init__(self, name: str, request: dict, response: dict):
+        self.name = name
+        try:
+            self.code = int(response['Code'])
+        except (KeyError, ValueError):
+            self.code = None
+        self.description = response.get('Description')
+        super().__init__(f'{name!r}: request {request} failed: {self.description} (code {self.code})')
+
+
 class DieboldNixdorfUSBTSE(TSEHandler):
-    def __init__(self, config: DieboldNixdorfUSBTSEConfig):
-        self.websocket_url = config.diebold_nixdorf_usb_ws_url
+    def __init__(self, name: str, config: DieboldNixdorfUSBTSEConfig):
+        self.websocket_url = config.ws_url
         self.websocket_timeout = config.ws_timeout
         self.background_task: typing.Optional[asyncio.Task] = None
         self.request_id = 0
         self.pending_requests: dict[int, asyncio.Future[dict]] = {}
+        self.password: str = config.password
+        self.serial_number: str
         self._started = asyncio.Event()
         self._stop = False
         self._ws = None
+        self._name = name
 
     async def start(self) -> bool:
         self._stop = False
@@ -38,31 +53,32 @@ class DieboldNixdorfUSBTSE(TSEHandler):
 
     async def run(self, start_result: asyncio.Future[bool]):
         async with contextlib.AsyncExitStack() as stack:
-            def set_ws(ws):
-                LOGGER.info(f'setting self._ws={ws}')
-                self._ws = ws
             try:
                 session = await stack.enter_async_context(aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.websocket_timeout, connect=self.websocket_timeout)))
-                LOGGER.info(f'connecting to DN TSE at {self.websocket_url!r}')
-                set_ws(await stack.enter_async_context(session.ws_connect(self.websocket_url)))
-            finally:
-                start_result.set_result(self._ws is not None)
 
-            stack.callback(set_ws, None)
+                try:
+                    LOGGER.info(f'{self._name!r}: connecting to {self.websocket_url}')
+                    self._ws = await stack.enter_async_context(session.ws_connect(self.websocket_url))
+                except aiohttp.ClientError as exc:
+                    LOGGER.error(f'{self._name!r}: Failed to connect to DN USB TSE: {exc}')
+                    start_result.set_result(False)
+                    return
 
-            receive_task = asyncio.create_task(self.recieve_loop())
-            async def await_receive_task():
-                await receive_task
-            stack.push_async_callback(await_receive_task)
-            stack.push_async_callback(self._ws.close)
+                receive_task = asyncio.create_task(self.recieve_loop())
+                async def await_receive_task():
+                    await receive_task
+                stack.push_async_callback(await_receive_task)
+                stack.push_async_callback(self._ws.close)
 
-            await self.request("SetDefaultClientId", ClientID="DummyDefaultClientId")
+                await self.request("SetDefaultClientID", ClientID="DummyDefaultClientId")
+                start_result.set_result(True)
+            except:
+                start_result.set_result(False)
+                raise
+
             while not self._stop:
-                print('sending pingpong')
-                result = await self.request("PingPong")
-                print(f'result: {result!r}')
+                await self.request("PingPong")
                 await asyncio.sleep(1)
-
 
     async def request(self, command: str, *, timeout: float = 5, **kwargs) -> dict:
         request_id = self.request_id
@@ -71,18 +87,28 @@ class DieboldNixdorfUSBTSE(TSEHandler):
         request = dict(Command=command, PingPong=request_id)
         request.update(kwargs)
 
-        LOGGER.info(f"{self}: sending request {request}")
-        await self._ws.send_str(f"\x02{json.dumps(request)}\x03")
+        LOGGER.info(f"{self}: >> {request}")
+        await self._ws.send_str(f"\x02{json.dumps(request)}\x03\n")
         future: asyncio.Future[dict] = asyncio.Future()
         self.pending_requests[request_id] = future
         try:
             response = await asyncio.wait_for(future, timeout=timeout)
-            LOGGER.info(f"{self}: got response {response}")
+            LOGGER.info(f"{self}: << {response}")
+            command_back = response.pop('Command')
+            if command_back != command:
+                raise RuntimeError(f'{self}: wrong command returned while processing {request}: {response}')
+            status = response.pop('Status')
+            if status != 'ok':
+                raise RequestError(self._name, request, response)
             return response
         except asyncio.TimeoutError:
             error_message = f"{self}: timeout while waiting for response to {request}"
             LOGGER.error(error_message)
-            raise asyncio.TimeoutError(error_message)
+            raise asyncio.TimeoutError(error_message) from None
+
+    async def request_with_password(self, *args, **kwargs):
+        kwargs["Password"] = base64.b64encode(self.password.encode('utf-8')).decode('ascii')
+        return await self.request(*args, **kwargs)
 
     async def recieve_loop(self):
         """
@@ -94,20 +120,17 @@ class DieboldNixdorfUSBTSE(TSEHandler):
             msg: aiohttp.WSMessage
             if msg.type == aiohttp.WSMsgType.TEXT:
                 msg.data: str
-                print(f'{msg.data=}')
-                if not msg.data.startswith("\x02") or not msg.endswith("\x03\n"):
+                if not msg.data.startswith("\x02") or not msg.data.endswith("\x03\n"):
                     LOGGER.error(f"{self}: Badly-formatted message: {msg!r}")
                     continue
                 try:
                     data = json.loads(msg.data[1:-2])
-                    print(f'{data=}')
                 except json.decoder.JSONDecodeError:
                     LOGGER.error(f"{self}: Invalid JSON: {msg!r}")
                     continue
                 if not isinstance(data, dict):
                     LOGGER.error(f"{self}: JSON data is not a dict: {data!r}")
                     continue
-                LOGGER.info(f"{self}: received reply {data}")
                 message_id = data.pop("PingPong")
                 if not isinstance(message_id, int):
                     LOGGER.error(f"{self}: JSON data has no int PingPong field: {msg!r}")
@@ -131,25 +154,37 @@ class DieboldNixdorfUSBTSE(TSEHandler):
         return await self.start()
 
     async def register_client_id(self, client_id: str):
-        result = await self.request("RegisterClientID", ClientID=client_id)
-        if result["Status"] != "ok":
-            raise RuntimeError(f"{self}: Could not register client ID: {result}")
+        await self.request_with_password("RegisterClientID", ClientID=client_id)
 
     async def deregister_client_id(self, client_id: str):
-        result = await self.request("DeRegisterClientID", ClientID=client_id)
-        if result["Status"] != "ok":
-            raise RuntimeError(f"{self}: Could not deregister client ID: {result}")
+        await self.request_with_password("DeregisterClientID", ClientID=client_id)
 
-    async def sign_order(self, order: Order) -> OrderSignature:
+    async def sign(self, request: TSESignatureRequest) -> TSESignature:
+        LOGGER.info(f"{self}: signing {request}")
+        await self.request_with_password(
+            "StartTransaction",
+            ClientID=request.till_name
+        )
+        await self.request_with_password(
+            "FinishTransaction",
+            ClientID=request.till_name,
+            Data={"ReceiptNumber": request.receipt_number}
+        )
         raise NotImplementedError()
 
     async def get_client_ids(self) -> list[str]:
-        result = await self.request("GetDeviceStatus")
-        if result["Status"] != "ok":
-            raise RuntimeError(f"{self}: Could not query device status: {result}")
-        result = result["ClientIDs"]
+        result = await self.request_with_password("GetDeviceStatus")
+        try:
+            result = result["ClientIDs"]
+        except KeyError:
+            raise RuntimeError(f"{self._name!r}: GetDeviceStatus did not return ClientIDs") from None
         if not isinstance(result, list) or any(not isinstance(x, str) for x in result):
-            raise RuntimeError(f"{self}: invalid device status: {result}")
+            raise RuntimeError(f"{self}: GetDeviceStatus returned bad result: {result}")
+        try:
+            # hide the default dummy client id
+            result.remove("DummyDefaultClientId")
+        except ValueError:
+            raise RuntimeError(f"TSE does not have 'DummyDefaultClientId' registered") from None
         return result
 
     def __str__(self):

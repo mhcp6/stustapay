@@ -232,6 +232,13 @@ class OrderService(DBService):
         return None
 
     @with_db_transaction
+    async def fetch_order(self, *, conn: asyncpg.Connection, order_id: int) -> Optional[Order]:
+        """
+        Like show_order, but does not check any user privileges.
+        """
+        return await self._fetch_order(conn=conn, order_id=order_id)
+
+    @with_db_transaction
     @requires_terminal([Privilege.cashier])
     async def list_orders_terminal(self, *, conn: asyncpg.Connection, current_user: User) -> list[Order]:
         cursor = conn.cursor("select * from order_value where ordr.cashier_id = $1", current_user.id)

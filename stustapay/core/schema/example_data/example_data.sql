@@ -140,10 +140,15 @@ insert into till (
     id, name, description, registration_uuid, session_uuid, tse_id, active_shift, active_profile_id
 )
 values
-    (0, 'Terminal 0', 'Test Terminal', null, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'tse 0', 'Shift 0', 0)
+    (0, 'Terminal 0', 'Test Terminal', null, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'tse1', 'Shift 0', 0)
     on conflict do nothing;
 select setval('till_id_seq', 100);
 
+insert into till_tse_history (
+    till_name, tse_id, what
+)
+values
+    (0, 'tse1', 'register');
 
 insert into ordr (
     id, itemcount, status, created_at, finished_at, payment_method, order_type,
@@ -200,5 +205,13 @@ values
     -- transaction 2 would not need a bon, as it is a top up
     on conflict do nothing;
 
-commit;
+insert into tse_signature (
+    id
+)
+values
+    (0),
+    (1),
+    (2)
+    on conflict do nothing;
 
+commit;

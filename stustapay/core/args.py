@@ -3,6 +3,7 @@ basic argument parsing
 """
 
 import argparse
+import traceback
 from .util import log_setup
 
 
