@@ -6,6 +6,7 @@ from .config import read_config
 from .signature_processor import SignatureProcessor
 from .simulator import Simulator
 from .tse_switchover import TseSwitchover
+from .fix_wrong_till_id_in_money_transfer import FixWrongMoneyTransfer
 
 
 def main():
@@ -20,6 +21,7 @@ def main():
     parser.add_subcommand("signature_processor", SignatureProcessor)
     parser.add_subcommand("simulator", Simulator)
     parser.add_subcommand("tse_switchover", TseSwitchover)
+    parser.add_subcommand("fix_wrong_money_transfer", FixWrongMoneyTransfer)
     ### / module registration
 
     loop = asyncio.new_event_loop()
